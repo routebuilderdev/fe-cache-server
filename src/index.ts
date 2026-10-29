@@ -20,11 +20,23 @@ global.fetch = fetch
 const app: Express = express()
 
 // Rate limit: 60 requests/minute per IP for geckoId endpoints
-app.use('/cgchart', rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false }))
-app.use('/supply', rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false }))
+// skipFailedRequests: true so 4xx/5xx responses don't count against quota
+// CoinGecko counts ALL responses (including 4xx/5xx) toward rate limit
+const coinGeckoRateLimit = rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  standardHeaders: 'draft-8', // Use latest RateLimit header draft
+  legacyHeaders: false,
+  skipFailedRequests: true, // Don't count 4xx/5xx against quota (CoinGecko counts all)
+  // Note: skipFailedRequests counts then uncounts - race condition on slow requests
+  // but acceptable for this public cache service
+})
+
+app.use('/cgchart', coinGeckoRateLimit)
+app.use('/supply', coinGeckoRateLimit)
 
 const cacheDir = path.join(os.tmpdir(), 'myapp-cache')
-const cacheTTL = 60 * 60 * 24
+const cacheTTL = 60 * 60 * 24 // 24 hours
 const CACHE_MAX_SIZE = 500 * 1024 * 1024 // 500 MB
 
 if (!fs.existsSync(cacheDir)) {
@@ -59,19 +71,27 @@ async function getCachedData(
 async function enforceCacheSizeLimit() {
     const index = await cacache.ls(cacheDir)
     let totalSize = 0
+    // cacache.ls() returns Record<string, CacheObject & { size: number }>
+    // Each entry has: key, integrity, path, time, size, metadata
     for (const entry of Object.values(index) as Array<{ size: number }>) {
         totalSize += entry.size
     }
     if (totalSize > CACHE_MAX_SIZE) {
+        console.log(`Cache size ${totalSize} exceeds limit ${CACHE_MAX_SIZE}, clearing`)
         await cacache.rm.all(cacheDir)
     }
 }
 
-const GECKO_ID_REGEX = /^[a-z0-9-]{1,100}$/
+// CoinGecko ID pattern: lowercase alphanumeric, dash, underscore, dot
+// Must start with alphanumeric, max 100 chars
+// Based on CoinGecko's actual ID format: ^[a-z0-9][a-z0-9._-]*$
+const GECKO_ID_REGEX = /^[a-z0-9][a-z0-9._-]{0,99}$/
 
 async function fetchJsonOk(url: string): Promise<any> {
     const response = await fetch(url)
     if (!response.ok) {
+        // CoinGecko returns 429 with Retry-After header on rate limit
+        // 4xx/5xx still count against rate limit per CoinGecko docs
         throw new Error(`HTTP ${response.status}`)
     }
     return response.json()
@@ -263,14 +283,21 @@ async function updateTop100TokensChartCache() {
 async function cleanupCache() {
     try {
         const now = Date.now()
-        const maxAgeMs = 60 * 60 * 24 * 7 * 1000
-        const entries = await cacache.ls(cacheDir)
-        for (const key of Object.keys(entries)) {
-            if (now - entries[key].time > maxAgeMs) {
-                await cacache.rm.entry(cacheDir, key)
-            }
-        }
-        await cacache.verify(cacheDir)
+        const maxAgeMs = 60 * 60 * 24 * 7 * 1000 // 7 days
+
+        // Use cacache.verify with filter to remove old entries atomically
+        // filter receives each entry; return false to remove it
+        // Entry format: { key, integrity, path, time, size, metadata }
+        await cacache.verify(cacheDir, {
+            filter: (entry) => {
+                if (!entry.time) return true // Keep entries without timestamp
+                return (now - entry.time) <= 60 * 60 * 24 * 7 * 1000
+            },
+            concurrency: 20 // Default, but explicit for clarity
+        })
+
+        // Also enforce size limit after cleanup
+        await enforceCacheSizeLimit()
     } catch (error) {
         console.error('Error during cache cleanup:', error)
     }
