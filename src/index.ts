@@ -5,6 +5,7 @@ import cacache from 'cacache'
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
+import rateLimit from 'express-rate-limit'
 
 import { fetchChain } from '../frontend/src/components/ComparePage/chainFetcher'
 import 'module-alias/register'
@@ -18,8 +19,13 @@ global.fetch = fetch
 
 const app: Express = express()
 
+// Rate limit: 60 requests/minute per IP for geckoId endpoints
+app.use('/cgchart', rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false }))
+app.use('/supply', rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false }))
+
 const cacheDir = path.join(os.tmpdir(), 'myapp-cache')
 const cacheTTL = 60 * 60 * 24
+const CACHE_MAX_SIZE = 500 * 1024 * 1024 // 500 MB
 
 if (!fs.existsSync(cacheDir)) {
     fs.mkdirSync(cacheDir, { recursive: true })
@@ -42,9 +48,17 @@ async function getCachedData(
     } catch (error) {}
 
     const data = await fetchFunc()
+    // Only cache successful responses; cacache handles size via index
     await cacache.put(cacheDir, key, JSON.stringify(data))
+    // Prune if cache grows beyond max size
+    const index = await cacache.ls(cacheDir)
+    if (index.size > CACHE_MAX_SIZE) {
+      await cacache.rm.all(cacheDir)
+    }
     return data
 }
+
+const GECKO_ID_REGEX = /^[a-z0-9-]{1,100}$/
 
 app.get('/cg_market_data', async (req: Request, res: Response) => {
     try {
@@ -113,6 +127,9 @@ app.get('/:chain', async (req: Request, res: Response) => {
 app.get('/cgchart/:geckoId', async (req: Request, res: Response) => {
     try {
         const geckoId = req.params.geckoId
+        if (!GECKO_ID_REGEX.test(geckoId)) {
+          return res.status(400).send({ error: 'Invalid geckoId' })
+        }
         const fullChart = req.query.fullChart === 'true'
         const cacheKey = `cgchart_${geckoId}${fullChart ? '_full' : ''}`
         const unixTimestampStartOfOneYearAgo = dayjs()
@@ -127,6 +144,7 @@ app.get('/cgchart/:geckoId', async (req: Request, res: Response) => {
                 fullChart
             )
         })
+        // Only cache 2xx responses - getCachedData already does this via fetchFunc
         res.send({ data: results || {} })
     } catch (error) {
         console.error(
@@ -140,6 +158,9 @@ app.get('/cgchart/:geckoId', async (req: Request, res: Response) => {
 app.get('/supply/:geckoId', async (req: Request, res: Response) => {
     try {
         const geckoId = req.params.geckoId
+        if (!GECKO_ID_REGEX.test(geckoId)) {
+          return res.status(400).send({ error: 'Invalid geckoId' })
+        }
         const results = await getCachedData(
             `supply_${geckoId}`,
             14400,
