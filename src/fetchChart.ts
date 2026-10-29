@@ -14,8 +14,8 @@ async function fetchChartData(geckoId: string, unixTimestamp: number, fullChart 
     const geckoUrl = `${CG_API}/${geckoId}/market_chart?vs_currency=usd&days=${fullChart ? 'max' : '365'}&x_cg_pro_api_key=${process.env.CG_KEY}`
 
     let [cgResponse, cgCoinData] = await Promise.all([
-        fetchJsonOk(geckoUrl),
-        fetchJsonOk(`${CG_API}/${geckoId}?x_cg_pro_api_key=${process.env.CG_KEY}`),
+        fetchJsonOk(geckoUrl).catch(() => null),
+        fetchJsonOk(`${CG_API}/${geckoId}?x_cg_pro_api_key=${process.env.CG_KEY}`).catch(() => null),
     ])
 
     let chart = cgResponse?.prices
