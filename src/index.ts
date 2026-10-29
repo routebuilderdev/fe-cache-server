@@ -48,17 +48,34 @@ async function getCachedData(
     } catch (error) {}
 
     const data = await fetchFunc()
-    // Only cache successful responses; cacache handles size via index
+    // Only cache successful responses
     await cacache.put(cacheDir, key, JSON.stringify(data))
     // Prune if cache grows beyond max size
-    const index = await cacache.ls(cacheDir)
-    if (index.size > CACHE_MAX_SIZE) {
-      await cacache.rm.all(cacheDir)
-    }
+    await enforceCacheSizeLimit()
     return data
 }
 
+// Calculate total cache size from cacache index and clear if over limit
+async function enforceCacheSizeLimit() {
+    const index = await cacache.ls(cacheDir)
+    let totalSize = 0
+    for (const entry of Object.values(index)) {
+        totalSize += entry.size
+    }
+    if (totalSize > CACHE_MAX_SIZE) {
+        await cacache.rm.all(cacheDir)
+    }
+}
+
 const GECKO_ID_REGEX = /^[a-z0-9-]{1,100}$/
+
+async function fetchJsonOk(url: string): Promise<any> {
+    const response = await fetch(url)
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+    }
+    return response.json()
+}
 
 app.get('/cg_market_data', async (req: Request, res: Response) => {
     try {
@@ -66,12 +83,10 @@ app.get('/cg_market_data', async (req: Request, res: Response) => {
             'cg_crypto_market_data',
             60 * 60,
             async () => {
-                const response = await fetch(
-                    `https://pro-api.coingecko.com/api/v3/global?x_cg_pro_api_key=${process.env.CG_KEY}`
-                ).then((res) => res.json())
-                const defiResponse = await fetch(
-                    `https://pro-api.coingecko.com/api/v3/global/decentralized_finance_defi?x_cg_pro_api_key=${process.env.CG_KEY}`
-                ).then((res) => res.json())
+                const [response, defiResponse] = await Promise.all([
+                    fetchJsonOk(`https://pro-api.coingecko.com/api/v3/global?x_cg_pro_api_key=${process.env.CG_KEY}`),
+                    fetchJsonOk(`https://pro-api.coingecko.com/api/v3/global/decentralized_finance_defi?x_cg_pro_api_key=${process.env.CG_KEY}`)
+                ])
                 return { ...response.data, ...defiResponse.data }
             }
         )
@@ -89,9 +104,7 @@ app.get('/exchanges', async (req: Request, res: Response) => {
             'cg_exchanges_data',
             60 * 60,
             async () => {
-                const response = await fetch(
-                    `https://pro-api.coingecko.com/api/v3/exchanges?x_cg_pro_api_key=${process.env.CG_KEY}`
-                ).then((res) => res.json())
+                const response = await fetchJsonOk(`https://pro-api.coingecko.com/api/v3/exchanges?x_cg_pro_api_key=${process.env.CG_KEY}`)
                 return response
             }
         )
@@ -144,7 +157,7 @@ app.get('/cgchart/:geckoId', async (req: Request, res: Response) => {
                 fullChart
             )
         })
-        // Only cache 2xx responses - getCachedData already does this via fetchFunc
+        // Only cache 2xx responses - getCachedData uses fetchJsonOk for CoinGecko calls
         res.send({ data: results || {} })
     } catch (error) {
         console.error(
@@ -165,9 +178,9 @@ app.get('/supply/:geckoId', async (req: Request, res: Response) => {
             `supply_${geckoId}`,
             14400,
             async () => {
-                const data = await fetch(
+                const data = await fetchJsonOk(
                     `https://pro-api.coingecko.com/api/v3/coins/${geckoId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false&x_cg_pro_api_key=${process.env.CG_KEY}`
-                ).then((res) => res.json())
+                )
                 return { total_supply: data?.['market_data']?.['total_supply'] ?? null }
             }
         )
@@ -214,6 +227,7 @@ async function fetchTop100Tokens() {
         const response = await fetch(
             `https://pro-api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false&x_cg_pro_api_key=${process.env.CG_KEY}`
         )
+        if (!response.ok) return null
         const data = await response.json()
         return data
     } catch (error) {
@@ -229,6 +243,7 @@ async function updateChartCache(geckoId: string) {
         const results = await fetchChartData(geckoId, 0, fullChart)
         if (results && results.prices) {
             await cacache.put(cacheDir, cacheKey, JSON.stringify(results))
+            await enforceCacheSizeLimit()
         }
     } catch (error) {}
 }
@@ -241,7 +256,6 @@ async function updateTop100TokensChartCache() {
                 await updateChartCache(token.id)
                 await sleep(5000)
             }
-        } else {
         }
     } catch (error) {}
 }
