@@ -59,7 +59,7 @@ async function getCachedData(
 async function enforceCacheSizeLimit() {
     const index = await cacache.ls(cacheDir)
     let totalSize = 0
-    for (const entry of Object.values(index)) {
+    for (const entry of Object.values(index) as Array<{ size: number }>) {
         totalSize += entry.size
     }
     if (totalSize > CACHE_MAX_SIZE) {
